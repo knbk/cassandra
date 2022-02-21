@@ -19,24 +19,38 @@
 package org.apache.cassandra.cql3.validation;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.After;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
+import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.validation.operations.ThriftCQLTester;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.marshal.AsciiType;
+import org.apache.cassandra.db.marshal.BytesType;
+import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.CounterColumnType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.LongType;
+import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.locator.SimpleStrategy;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.Tables;
+import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.thrift.Cassandra;
 import org.apache.cassandra.thrift.CfDef;
@@ -45,6 +59,7 @@ import org.apache.cassandra.thrift.ColumnDef;
 import org.apache.cassandra.thrift.ColumnOrSuperColumn;
 import org.apache.cassandra.thrift.ColumnParent;
 import org.apache.cassandra.thrift.ColumnPath;
+import org.apache.cassandra.thrift.ConsistencyLevel;
 import org.apache.cassandra.thrift.CounterColumn;
 import org.apache.cassandra.thrift.CounterSuperColumn;
 import org.apache.cassandra.thrift.Deletion;
@@ -56,8 +71,14 @@ import org.apache.cassandra.thrift.SuperColumn;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.apache.cassandra.thrift.ConsistencyLevel.ONE;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 public class ThriftIntegrationTest extends ThriftCQLTester
 {
@@ -804,6 +825,44 @@ public class ThriftIntegrationTest extends ThriftCQLTester
                    row(3));
         assertRows(execute(String.format("select avg(col1) from %s.%s", KEYSPACE, currentSparseTable())),
                    row(3L));
+    }
+
+    @Test
+    public void testLegacySuperColumnThriftSuperSliceQuery() throws Throwable
+    {
+        String tableName = "legacy_supercolumn";
+        // Legacy supercolumn (upgraded from <3.0) cannot be created throught Thrift as it has isCompound: true.
+        MigrationManager.announceNewColumnFamily(CFMetaData.Builder.createSuper(KEYSPACE, tableName, false)
+                                                                   .addPartitionKey("key", UTF8Type.instance)
+                                                                   .addClusteringColumn("column1", UTF8Type.instance)
+                                                                   .addRegularColumn("", MapType.getInstance(UTF8Type.instance, LongType.instance, true))
+                                                                   .build());
+
+        execute(String.format("insert into \"%s\".\"%s\" (key, column1, column2, value) values (?, ?, ?, ?)", KEYSPACE, tableName),
+                "key1", "ck1", "ck2", 1L);
+        assertRows(execute(String.format("select key, column1, column2, value from \"%s\".\"%s\" where key = ?", KEYSPACE, tableName), "key1"),
+                   row("key1", "ck1", "ck2", 1L));
+
+        Cassandra.Client client = getClient();
+        ColumnParent parent = new ColumnParent(tableName);
+        SlicePredicate predicate = new SlicePredicate();
+        predicate.setSlice_range(new SliceRange(ByteBufferUtil.bytes("ck1"), ByteBufferUtil.bytes("ck1"), false, 100));
+        List<ColumnOrSuperColumn> result = client.get_slice(ByteBufferUtil.bytes("key1"), parent, predicate, ONE);
+
+        assertEquals(1, result.size());
+        ColumnOrSuperColumn cosc = result.get(0);
+
+        assertFalse(cosc.isSetColumn());
+        assertTrue(cosc.isSetSuper_column());
+
+        SuperColumn superColumn = cosc.getSuper_column();
+        assertEquals(ByteBufferUtil.bytes("ck1"), superColumn.bufferForName());
+
+        List<Column> columns = superColumn.getColumns();
+        assertEquals(1, columns.size());
+        Column column = columns.get(0);
+        assertEquals(ByteBufferUtil.bytes("ck2"), column.bufferForName());
+        assertEquals(ByteBufferUtil.bytes(1L), column.bufferForValue());
     }
 
     private void populateDenseTable() throws Throwable
