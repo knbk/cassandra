@@ -42,6 +42,7 @@ import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.context.CounterContext;
 import org.apache.cassandra.db.filter.*;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.TimeUUIDType;
 import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.db.rows.*;
@@ -374,6 +375,20 @@ public class CassandraServer implements Cassandra.Iface
         // Note that in thrift, the bounds are reversed if the query is reversed, but not internally.
         ByteBuffer start = range.reversed ? range.finish : range.start;
         ByteBuffer finish = range.reversed ? range.start : range.finish;
+
+        // Legacy supercolumn tables (upgraded from 2.2) are marked as compound, but for compatibility we treat them as
+        // non-compound when filtering on the supercolumn name through Thrift. Supercolumn tables have a single
+        // clustering (which may itself be composite). Do not handle empty or static bounds.
+        if (metadata.isSuper() && metadata.isCompound() && metadata.comparator.size() == 1) {
+            if (start.hasRemaining() && !CompositeType.isStaticName(start)) {
+                start = CompositeType.build(start);
+            }
+
+            if (finish.hasRemaining() && !CompositeType.isStaticName(finish)) {
+                finish = CompositeType.build(finish);
+            }
+        }
+
         return Slices.with(metadata.comparator, Slice.make(LegacyLayout.decodeSliceBound(metadata, start, true).bound, LegacyLayout.decodeSliceBound(metadata, finish, false).bound));
     }
 
